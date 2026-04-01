@@ -721,7 +721,9 @@ def _rocm_aiter_fused_allreduce_rmsnorm_impl(
         size_ok = False
 
     use_1stage = hidden_ok and token_ok and size_ok
-    result = aiter_ar.custom_fused_ar_rms(input_, residual, weight, epsilon, use_1stage)
+    result = aiter_ar.custom_fused_ar_rms(
+        input_, residual, weight, epsilon, use_1stage
+    )
     assert result is not None
     return result[0], result[1]
 
@@ -1335,35 +1337,6 @@ class rocm_aiter_ops:
     def get_aiter_allreduce_max_size(cls) -> int:
         return cls._ALL_REDUCE_MAX_SIZE
 
-    @classmethod
-    @if_aiter_supported
-    def is_fused_allreduce_rmsnorm_supported(cls) -> bool:
-        """Check if fused allreduce+RMSNorm is supported on this platform.
-
-        Requires gfx950 (MI355X), AITER enabled, RMSNorm kernels available,
-        and AITER's CustomAllreduce communicator importable.
-
-        Currently only wired in deepseek_v2.py (DeepSeek V2/V3/R1 family).
-        Other models are unaffected because they do not set
-        ``fused_allreduce=True`` on their RMSNorm layers. Models that
-        inherit DeepseekV2DecoderLayer (Eagle, MTP, Mistral Large 3)
-        automatically benefit when running on MI355X with TP > 1.
-
-        Returns None (falsy) on non-ROCm platforms via @if_aiter_supported.
-        """
-        from vllm.platforms.rocm import on_gfx950
-
-        if not (cls._AITER_ENABLED and cls._RMSNORM_ENABLED and on_gfx950()):
-            return False
-        try:
-            from aiter.dist.device_communicators.custom_all_reduce import (
-                CustomAllreduce as _,  # noqa: F401
-            )
-
-            return True
-        except ImportError:
-            return False
-
     @staticmethod
     @if_aiter_supported
     def register_ops_once() -> None:
@@ -1559,6 +1532,10 @@ class rocm_aiter_ops:
             _OPS_REGISTERED = True
 
     @staticmethod
+    def get_fused_allreduce_rmsnorm_op() -> OpOverload:
+        return torch.ops.vllm.rocm_aiter_fused_allreduce_rmsnorm.default
+
+    @staticmethod
     def get_rmsnorm_fused_add_op() -> OpOverload:
         return torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add.default
 
@@ -1601,10 +1578,6 @@ class rocm_aiter_ops:
     @staticmethod
     def get_triton_rotary_embedding_op() -> OpOverload:
         return torch.ops.vllm.rocm_aiter_triton_rotary_embedding.default
-
-    @staticmethod
-    def get_fused_allreduce_rmsnorm_op() -> OpOverload:
-        return torch.ops.vllm.rocm_aiter_fused_allreduce_rmsnorm.default
 
     @staticmethod
     def rms_norm(

@@ -137,9 +137,9 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
                     self.passes += [AsyncTPPass(config)]
 
             if self.pass_config.fuse_allreduce_rms:
-                if rocm_aiter_ops.is_enabled():
-                    self.passes += [RocmAiterAllReduceFusionPass(config)]
-                else:
+                if not rocm_aiter_ops.is_enabled():
+                    # CUDA: AllReduceFusionPass has three-way patterns
+                    # (allreduce + rmsnorm + fp8_quant) so it runs first.
                     self.passes += [AllReduceFusionPass(config)]
 
             if self.pass_config.fuse_norm_quant:
@@ -148,6 +148,14 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
                     self.passes += [
                         RocmAiterRMSNormQuantFusionPass(config),
                     ]
+
+            if self.pass_config.fuse_allreduce_rms:
+                if rocm_aiter_ops.is_enabled():
+                    # ROCm: runs AFTER norm+quant fusion so that on FP8,
+                    # rmsnorm+fp8_quant fuses first (AITER's fused AR kernel
+                    # doesn't support FP8 output). On FP4/BF16 the rmsnorm
+                    # is still free for allreduce+rmsnorm fusion.
+                    self.passes += [RocmAiterAllReduceFusionPass(config)]
             if self.pass_config.fuse_act_quant:
                 self.passes += [ActivationQuantFusionPass(config)]
                 if rocm_aiter_ops.is_enabled():

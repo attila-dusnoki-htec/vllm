@@ -82,6 +82,52 @@ class TestAllReduceRMSNormModel(torch.nn.Module):
         return [torch.ops.vllm.flashinfer_trtllm_fused_allreduce_norm.default]
 
 
+class TestAllReduceViewRMSNormModel(torch.nn.Module):
+    """Simulates DeepSeek MoE pattern: all_reduce -> view -> fused_add_rmsnorm.
+
+    The graph normalization pre-pass should commute view past all_reduce
+    so the all_reduce -> fused_add_rmsnorm pattern can match.
+    """
+
+    def __init__(self, hidden_size=16, token_num=16, eps=1e-6, use_aiter=False):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.token_num = token_num
+        self.eps = eps
+        self.norm = [RMSNorm(hidden_size, eps) for i in range(4)]
+        self.w = [torch.rand(hidden_size, hidden_size) for _ in range(3)]
+        self.use_aiter = use_aiter
+
+    def forward(self, x):
+        z = torch.relu(x)
+        x = resid = tensor_model_parallel_all_reduce(z)
+        y = self.norm[0](x)
+
+        z2 = torch.mm(y, self.w[0])
+        x2 = tensor_model_parallel_all_reduce(z2)
+        x2 = x2.view(-1, self.hidden_size)
+        y2, resid = self.norm[1](x2, resid)
+
+        z3 = torch.mm(y2, self.w[1])
+        x3 = tensor_model_parallel_all_reduce(z3)
+        x3 = x3.view(-1, self.hidden_size)
+        y3, resid = self.norm[2](x3, resid)
+
+        z4 = torch.mm(y3, self.w[2])
+        x4 = tensor_model_parallel_all_reduce(z4)
+        x4 = x4.view(-1, self.hidden_size)
+        y4, resid = self.norm[3](x4, resid)
+        return y4
+
+    def ops_in_model_before(self):
+        return [torch.ops.vllm.all_reduce.default]
+
+    def ops_in_model_after(self):
+        if self.use_aiter:
+            return [rocm_aiter_ops.get_fused_allreduce_rmsnorm_op()]
+        return [torch.ops.vllm.flashinfer_trtllm_fused_allreduce_norm.default]
+
+
 class TestAllReduceRMSNormStaticQuantFP8Model(torch.nn.Module):
     quant_key = kFp8StaticTensorSym
 
@@ -195,6 +241,7 @@ class TestAllReduceFusedAddRMSNormStaticQuantFP4Model(torch.nn.Module):
     "test_model, enable_quant_fp8_custom_op, use_aiter",
     [
         (TestAllReduceRMSNormModel, False, IS_AITER_FOUND),
+        (TestAllReduceViewRMSNormModel, False, IS_AITER_FOUND),
         pytest.param(
             TestAllReduceRMSNormStaticQuantFP8Model,
             True,
@@ -356,9 +403,9 @@ def all_reduce_fusion_pass_on_test_model(
     with set_current_vllm_config(vllm_config):
         initialize_model_parallel(tensor_model_parallel_size=world_size)
         all_reduce_fusion_pass = (
-            AllReduceFusionPass(vllm_config)
+            RocmAiterAllReduceFusionPass(vllm_config)
             if use_aiter
-            else RocmAiterAllReduceFusionPass(vllm_config)
+            else AllReduceFusionPass(vllm_config)
         )
         noop_pass = NoOpEliminationPass(vllm_config)
         func_pass = FixFunctionalizationPass(vllm_config)

@@ -32,7 +32,7 @@ from vllm.utils.torch_utils import (
 
 from ..inductor_pass import enable_fake_mode
 from ..vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
-from .matcher_utils import MatcherFusedAddRMSNorm, MatcherQuantFP8
+from .matcher_utils import MatcherFusedAddRMSNorm, MatcherQuantFP8, MatcherRMSNorm
 
 FP8_DTYPE = current_platform.fp8_dtype()
 
@@ -963,6 +963,25 @@ class AiterAllreduceFusedAddRMSNormPattern:
 
 
 class RocmAiterAllReduceFusionPass(VllmPatternMatcherPass):
+    """Fuse all_reduce + rmsnorm into AITER's fused allreduce+rmsnorm kernel.
+
+    FP4/BF16 vs FP8 behavior:
+      This pass MUST run AFTER RocmAiterRMSNormQuantFusionPass (enforced by
+      pass ordering in pass_manager.py). On the FP8 path, rmsnorm+fp8_quant
+      is fused first by the quant pass, consuming the rmsnorm node. This pass
+      then finds no all_reduce->rmsnorm adjacency and leaves allreduce
+      separate -- which is correct because AITER's fused AR kernel does not
+      support FP8 quantized output.
+
+      On FP4/BF16, no quant fusion occurs, so the rmsnorm remains available
+      for allreduce+rmsnorm fusion here.
+
+    Graph normalization:
+      DeepSeek MoE inserts a .view() between all_reduce and the next
+      rmsnorm. The _commute_view_past_allreduce pre-pass commutes view
+      past all_reduce to restore pattern adjacency.
+    """
+
     def __init__(self, config: VllmConfig) -> None:
         super().__init__(config)
         self.disabled = True
@@ -1037,11 +1056,78 @@ class RocmAiterAllReduceFusionPass(VllmPatternMatcherPass):
             return False
         return bool(compile_range.end <= self.max_token_num)
 
+    def _commute_view_past_allreduce(self, graph: fx.Graph) -> int:
+        """
+        Commute view/reshape past all_reduce to expose all_reduce -> rmsnorm
+        adjacency for pattern matching.
+
+        Transforms: view(all_reduce(x), shape) -> all_reduce(view(x, shape))
+
+        This is safe because all_reduce is element-wise (sums corresponding
+        elements across ranks) and view/reshape only reinterprets shape without
+        moving data. The result is identical regardless of order.
+
+        This handles DeepSeek's MoE path where the allreduce output goes
+        through a .view() before reaching the next layer's RMSNorm.
+        """
+        all_reduce_op = torch.ops.vllm.all_reduce.default
+        view_ops = {
+            torch.ops.aten.view.default,
+            torch.ops.aten.reshape.default,
+        }
+
+        count = 0
+        for node in list(graph.nodes):
+            if not (node.op == "call_function" and node.target == all_reduce_op):
+                continue
+
+            users = list(node.users)
+            if len(users) != 1:
+                continue
+            view_node = users[0]
+            if not (
+                view_node.op == "call_function" and view_node.target in view_ops
+            ):
+                continue
+
+            ar_input = node.args[0]
+            ar_extra_args = node.args[1:]
+            view_shape = view_node.args[1]
+
+            with graph.inserting_before(node):
+                new_view = graph.call_function(
+                    view_node.target,
+                    args=(ar_input, view_shape),
+                    kwargs=dict(view_node.kwargs),
+                )
+
+            node.args = (new_view,) + ar_extra_args
+
+            if "val" in view_node.meta:
+                node.meta["val"] = view_node.meta["val"]
+            if hasattr(ar_input, "meta") and "val" in ar_input.meta:
+                new_view.meta["val"] = view_node.meta.get(
+                    "val", ar_input.meta["val"]
+                )
+
+            view_node.replace_all_uses_with(node)
+            graph.erase_node(view_node)
+            count += 1
+
+        return count
+
     @VllmInductorPass.time_and_log
     def __call__(self, graph: fx.Graph):
         if self.disabled:
             logger.debug("ROCmAiterAllReduceRMSNormFusionPass disabled")
             return
+
+        commuted = self._commute_view_past_allreduce(graph)
+        if commuted:
+            logger.debug(
+                "Commuted %d view/reshape past all_reduce for pattern matching",
+                commuted,
+            )
 
         self.matched_count = self.patterns.apply(graph)
         logger.debug("Replaced %s patterns", self.matched_count)
@@ -1057,4 +1143,5 @@ class RocmAiterAllReduceFusionPass(VllmPatternMatcherPass):
             self,
             AiterAllreduceFusedRMSNormPattern,
             AiterAllreduceFusedAddRMSNormPattern,
+            self._commute_view_past_allreduce,
         )

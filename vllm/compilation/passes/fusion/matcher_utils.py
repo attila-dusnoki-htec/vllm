@@ -159,6 +159,46 @@ class MatcherRotaryEmbedding(MatcherCustomOp):
         return result
 
 
+class MatcherRMSNorm(MatcherCustomOp):
+    """Matcher for plain RMSNorm (without residual add)."""
+
+    def __init__(
+        self,
+        epsilon: float,
+        enabled: bool | None = None,
+        match_rocm_aiter: bool = False,
+    ) -> None:
+        if enabled is None:
+            enabled = RMSNorm.enabled()
+
+        super().__init__(enabled)
+        self.epsilon = epsilon
+        self.match_rocm_aiter = match_rocm_aiter
+
+    def inputs(self) -> list[torch.Tensor]:
+        input = self.empty(5, 16) if self.enabled else self.empty_f32(5, 16)
+        weight = self.empty(16)
+        return [input, weight]
+
+    def forward_custom(
+        self,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> torch.Tensor:
+        import vllm.ir.ops
+
+        return vllm.ir.ops.rms_norm(input, weight, self.epsilon)
+
+    def forward_native(
+        self,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> torch.Tensor:
+        import vllm.ir.ops
+
+        return vllm.ir.ops.rms_norm(input, weight, self.epsilon)
+
+
 class MatcherFusedAddRMSNorm(MatcherCustomOp):
     def __init__(
         self,
